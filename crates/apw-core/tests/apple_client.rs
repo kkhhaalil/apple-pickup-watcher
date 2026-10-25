@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use apw_core::apple::{ApiError, AppleClient, ClientConfig, RequestProfile, Transport, WarmPage};
+use apw_core::apple::{
+    ApiError, AppleClient, ClientConfig, RequestProfile, SessionPolicy, Transport, WarmPage,
+};
 use apw_core::model::{Category, Family, Region};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -374,6 +376,78 @@ async fn 被拦后不重试并进入冷却() {
         records
             .iter()
             .all(|r| r.status.is_some() || r.kind == "warm")
+    );
+}
+
+#[tokio::test]
+async fn 被拦后连cookie罐一起换掉() {
+    let blocking = |path: &str| {
+        if path.starts_with(PICKUP_PATH) {
+            (541, Vec::new(), "<html>Page Not Found</html>".into())
+        } else {
+            healthy(path)
+        }
+    };
+    let parts = ["MG724CH/A".to_string()];
+
+    let apple = FakeApple::start(blocking).await;
+    let region = apple.region();
+    let client = fast(ClientConfig::default());
+    assert!(client.pickup_message(region, "R683", &parts).await.is_err());
+    assert_eq!(
+        apple.requests(PICKUP_PATH)[0].header("cookie"),
+        Some("dssid2=secret-value"),
+        "被拦的那次是带着暖场 cookie 去的"
+    );
+    assert_eq!(
+        client.cookies_for(region).await,
+        None,
+        "被烧掉的会话不能留到冷却后的探测里再用"
+    );
+
+    // 关掉开关就保留上游行为：只清暖场标记，罐还在。
+    let apple = FakeApple::start(blocking).await;
+    let region = apple.region();
+    let client = fast(ClientConfig {
+        reset_session_on_block: false,
+        ..ClientConfig::default()
+    });
+    assert!(client.pickup_message(region, "R683", &parts).await.is_err());
+    assert!(client.cookies_for(region).await.is_some());
+}
+
+#[tokio::test]
+async fn 会话用满后换新罐重新暖场() {
+    let apple = FakeApple::start(healthy).await;
+    let region = apple.region();
+    let client = fast(ClientConfig {
+        session: Some(SessionPolicy {
+            max_requests: 2,
+            max_age: Duration::from_secs(3600),
+            jitter: 0.0,
+        }),
+        ..ClientConfig::default()
+    });
+
+    for _ in 0..5 {
+        client
+            .pickup_message(region, "R683", &["MG724CH/A".to_string()])
+            .await
+            .expect("查询应当成功");
+    }
+    // 每两次查询一个会话：第 1、3、5 次之前各暖一次场。
+    let warms = apple.requests(BAG_PATH);
+    assert_eq!(warms.len(), 3);
+    assert!(
+        warms.iter().all(|w| w.header("cookie").is_none()),
+        "新会话的暖场不能带着旧会话的 cookie：{warms:?}"
+    );
+    let pickups = apple.requests(PICKUP_PATH);
+    assert_eq!(pickups.len(), 5);
+    assert!(
+        pickups
+            .iter()
+            .all(|p| p.header("cookie") == Some("dssid2=secret-value"))
     );
 }
 

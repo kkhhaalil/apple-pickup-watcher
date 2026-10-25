@@ -276,6 +276,40 @@ impl Default for Budget {
     }
 }
 
+/// 每条线路的会话用多久就主动换掉。
+///
+/// # 为什么要主动换
+///
+/// 2026-10-25 服务端第一次长时间扫描（100 个代理、每条线路约 0.76 次/分钟）里，
+/// 一半线路各自发到第 30 次左右就开始 541，另一半在第 55 次左右，和 [`Budget`]
+/// 里记的「约 30 次后开始 541」是同一个现象。所有线路同一刻暖场、轮流平摊请求，
+/// 计数一起涨，于是一起撞线；被拦之后拿着同一份会话去探测，又一起失败。
+///
+/// 在撞线之前就换一份新会话（新的 cookie 罐、新的连接），计数从头来；上限按
+/// `jitter` 给每条线路、每个会话各抽一次签，线路之间就不会同步到期。
+///
+/// 默认不开（[`ClientConfig::session`] 为 `None`）：桌面端一条线路几分钟一次，
+/// 用不到这个；它是给服务端批量扫描准备的。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SessionPolicy {
+    /// 一个会话最多发多少次取货查询（暖场不算）。
+    pub max_requests: u32,
+    /// 一个会话最多用多久。
+    pub max_age: Duration,
+    /// 抖动比例，0～1：每个会话的上限在 `[(1 - jitter) × 上限, 上限]` 里随机取。
+    pub jitter: f64,
+}
+
+impl SessionPolicy {
+    /// 按 `draw`（[0, 1) 里的随机数）抽出这个会话的上限。请求数至少为 1。
+    fn limit(&self, draw: f64) -> (u32, Duration) {
+        let jitter = self.jitter.clamp(0.0, 1.0);
+        let scale = 1.0 - jitter * draw.clamp(0.0, 1.0);
+        let requests = ((f64::from(self.max_requests) * scale).round() as u32).max(1);
+        (requests, self.max_age.mul_f64(scale))
+    }
+}
+
 /// 令牌桶的当前状态。`tokens` 允许为负：负数表示已经预约出去、要等恢复的额度。
 #[derive(Debug)]
 struct BudgetState {
@@ -425,7 +459,13 @@ struct Route {
     label: String,
     /// 代理线路的地址，去掉了账号密码，出错时告诉用户是哪个代理连不上；直连为 `None`。
     endpoint: Option<String>,
-    http: Http,
+    /// 完整的代理地址（含账号密码），换会话时重建传输层要用。**不要打印它**。
+    proxy: Option<String>,
+    /// 传输层与 cookie 罐。两个库的罐都没有「清空」，换会话就整个换掉：
+    /// 连接池一起丢，下一次请求是新的连接、新的罐，和新开一个浏览器一样。
+    /// 正在飞的请求拿着旧的克隆跑完即可。
+    http: std::sync::RwLock<Http>,
+    session: std::sync::Mutex<SessionState>,
     warm: Mutex<HashMap<String, WarmState>>,
     blocks: Mutex<BlockTracker>,
     budget: Mutex<BudgetState>,
@@ -436,7 +476,13 @@ impl Route {
         Ok(Self {
             label,
             endpoint: proxy.map(redact_proxy),
-            http: Http::build(config, proxy)?,
+            proxy: proxy.map(str::to_string),
+            http: std::sync::RwLock::new(Http::build(config, proxy)?),
+            session: std::sync::Mutex::new(SessionState::new(
+                config.session.as_ref(),
+                Instant::now(),
+                rand::random(),
+            )),
             warm: Mutex::new(HashMap::new()),
             blocks: Mutex::new(BlockTracker::default()),
             budget: Mutex::new(BudgetState::new(&config.budget, Instant::now())),
@@ -446,11 +492,98 @@ impl Route {
     fn is_proxy(&self) -> bool {
         self.label != "direct"
     }
+
+    fn http(&self) -> Http {
+        self.http.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 当前会话的代号。每换一次会话加一，暖场标记和「被拦后换会话」都靠它认是不是同一个会话。
+    fn generation(&self) -> u64 {
+        self.lock_session().generation
+    }
+
+    fn lock_session(&self) -> std::sync::MutexGuard<'_, SessionState> {
+        self.session.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 记一次取货查询。
+    fn count_request(&self) {
+        self.lock_session().requests += 1;
+    }
+
+    /// 如果当前还是第 `generation` 个会话，就丢掉它换一个新的，返回是否真的换了。
+    ///
+    /// 带代号是为了并发：同一轮里几个请求一起被拦，只该换一次，不能新会话刚建好
+    /// 就被晚到的那几个结果又换掉。
+    fn renew_session(&self, config: &ClientConfig, generation: u64) -> bool {
+        let mut session = self.lock_session();
+        if session.generation != generation {
+            return false;
+        }
+        // 第一次构造时已经成功过，同样的参数不会失败；万一失败就继续用旧的。
+        let Ok(http) = Http::build(config, self.proxy.as_deref()) else {
+            return false;
+        };
+        *self.http.write().unwrap_or_else(|e| e.into_inner()) = http;
+        *session = session.renewed(config.session.as_ref(), Instant::now(), rand::random());
+        true
+    }
+
+    /// 会话用满了（请求数或时长到了 [`SessionPolicy`] 的上限）就换新的。
+    fn rotate_if_due(&self, config: &ClientConfig) -> bool {
+        let generation = {
+            let session = self.lock_session();
+            if !session.due(Instant::now()) {
+                return false;
+            }
+            session.generation
+        };
+        self.renew_session(config, generation)
+    }
 }
 
 impl std::fmt::Debug for Route {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}[{}]", self.label, self.http.label())
+        write!(f, "{}[{}]", self.label, self.http().label())
+    }
+}
+
+/// 一条线路当前会话的账本。纯状态，不碰网络，便于单测。
+#[derive(Debug, Clone, PartialEq)]
+struct SessionState {
+    generation: u64,
+    started: Instant,
+    /// 这个会话已经发出的取货查询数。
+    requests: u32,
+    /// 这个会话的上限，已经按 [`SessionPolicy::jitter`] 抽过签；`None` 表示不主动轮换。
+    limit: Option<(u32, Duration)>,
+}
+
+impl SessionState {
+    /// `draw` 是 [0, 1) 里的一个随机数，决定这个会话在抖动区间里取多少。
+    fn new(policy: Option<&SessionPolicy>, now: Instant, draw: f64) -> Self {
+        Self {
+            generation: 0,
+            started: now,
+            requests: 0,
+            limit: policy.map(|p| p.limit(draw)),
+        }
+    }
+
+    fn renewed(&self, policy: Option<&SessionPolicy>, now: Instant, draw: f64) -> Self {
+        Self {
+            generation: self.generation + 1,
+            ..Self::new(policy, now, draw)
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        match self.limit {
+            None => false,
+            Some((requests, age)) => {
+                self.requests >= requests || now.saturating_duration_since(self.started) >= age
+            }
+        }
     }
 }
 
@@ -626,6 +759,14 @@ pub struct ClientConfig {
     /// 服务端批量扫描时应当关掉：否则服务器自己的 IP 也会轮到，而它通常就是
     /// 最先被风控盯上、又最不能被封的那个出口。关掉时代理列表不能为空。
     pub direct_route: bool,
+    /// 会话主动轮换策略，见 [`SessionPolicy`]。`None`（默认）表示不主动换。
+    pub session: Option<SessionPolicy>,
+    /// 被拦之后是否连 cookie 罐一起换掉，而不只是重新取一次暖场页。默认开。
+    ///
+    /// 被烧掉的会话重新取页面也救不回来：2026-10-25 那次，冷却 5 分钟、10 分钟后的
+    /// 两次探测都先用旧罐重新暖场，照样 541，直到第三次探测（又过了 20 分钟）才通过；
+    /// 而 worker 重启、换了新罐的线路立刻就通了。
+    pub reset_session_on_block: bool,
 }
 
 impl Default for ClientConfig {
@@ -640,6 +781,8 @@ impl Default for ClientConfig {
             budget: Budget::default(),
             proxies: Vec::new(),
             direct_route: true,
+            session: None,
+            reset_session_on_block: true,
         }
     }
 }
@@ -684,6 +827,8 @@ struct WarmState {
     warmed: bool,
     last_attempt: Option<Instant>,
     failures: u32,
+    /// 这些标记属于线路的第几个会话。会话换了，标记就作废，见 [`Route::generation`]。
+    generation: u64,
 }
 
 /// 某地区被拦后的冷却状态。
@@ -806,14 +951,14 @@ impl AppleClient {
 
     /// 罐里对某个地址生效的 cookie 名。
     pub async fn cookie_names_for(&self, url: &str) -> Vec<String> {
-        self.primary().await.http.cookie_names_for(url)
+        self.primary().await.http().cookie_names_for(url)
     }
 
     /// 这个地区当前攒到的 cookie，没有则返回 `None`。契约测试用；**不要打印它的值**。
     pub async fn cookies_for(&self, region: &Region) -> Option<String> {
         self.primary()
             .await
-            .http
+            .http()
             .cookie_header_for(&region.pickup_message_url())
     }
 
@@ -849,6 +994,14 @@ impl AppleClient {
 
         let mut states = route.warm.lock().await;
         let state = states.entry(region.locale.to_string()).or_default();
+        // 会话换过了：旧会话的暖场标记和失败退避都不算数，新罐得重新暖。
+        let generation = route.generation();
+        if state.generation != generation {
+            *state = WarmState {
+                generation,
+                ..WarmState::default()
+            };
+        }
         if state.warmed {
             return;
         }
@@ -859,12 +1012,13 @@ impl AppleClient {
         }
         state.last_attempt = Some(Instant::now());
 
+        let http = route.http();
         self.throttle(route).await;
         let started = Instant::now();
         let mut record = RequestRecord {
             at_ms: now_ms(),
             kind: "warm",
-            transport: route.http.label(),
+            transport: http.label(),
             route: route.label.clone(),
             locale: region.locale.to_string(),
             store: None,
@@ -874,13 +1028,12 @@ impl AppleClient {
             http_version: None,
             duration_ms: 0,
             outcome: String::new(),
-            cookies_sent: route.http.cookie_names_for(&url),
+            cookies_sent: http.cookie_names_for(&url),
             cookies_after: Vec::new(),
             final_url: None,
         };
 
-        let sent = route
-            .http
+        let sent = http
             .fetch(
                 &url,
                 &[],
@@ -895,7 +1048,7 @@ impl AppleClient {
                 record.status = Some(status);
                 record.http_version = Some(fetched.version);
                 record.final_url = Some(fetched.final_url);
-                let names = route.http.cookie_names_for(&region.pickup_message_url());
+                let names = http.cookie_names_for(&region.pickup_message_url());
                 let ok = (200..300).contains(&status) && !names.is_empty();
                 record.cookies_after = names;
                 record.outcome = if ok {
@@ -925,7 +1078,8 @@ impl AppleClient {
     /// 忘掉某地区的暖场标记，下一次会重新取页面。
     ///
     /// 被拦截时调用。cookie 会过期，也会被边缘节点作废；一直拿着一份不再被认可
-    /// 的 cookie 反复重试，只会一直被拦。只清标记不清罐：重新取页面会刷新会话。
+    /// 的 cookie 反复重试，只会一直被拦。这里只清标记；罐要不要一起换由
+    /// [`ClientConfig::reset_session_on_block`] 决定 —— 实测重新取页面救不回被烧掉的会话。
     async fn forget_warm(&self, route: &Route, region: &Region) {
         if let Some(state) = route.warm.lock().await.get_mut(region.locale) {
             state.warmed = false;
@@ -1079,7 +1233,12 @@ impl AppleClient {
             .into_iter()
             .filter(|m| m.store_number == store_number)
             .collect();
-        Ok(PickupDetail { stores: vec![store], meta, raw, route })
+        Ok(PickupDetail {
+            stores: vec![store],
+            meta,
+            raw,
+            route,
+        })
     }
 
     /// 一次查询 `location` 周边所有门店里 `parts` 各型号的可取货状态。
@@ -1121,7 +1280,12 @@ impl AppleClient {
             .await?;
         let stores = parse_pickup_stores(&raw)?;
         let meta = parse_store_meta(&raw);
-        Ok(PickupDetail { stores, meta, raw, route })
+        Ok(PickupDetail {
+            stores,
+            meta,
+            raw,
+            route,
+        })
     }
 
     /// 两种范围共用的一次取货查询：冷却检查、暖场、发请求、被拦登记。
@@ -1163,7 +1327,10 @@ impl AppleClient {
             };
             tried.push(route.label.clone());
 
-            // 先把 cookie 攒上再查，见 ensure_warm；暖不上也照常查。
+            // 会话用满了先换掉，再把 cookie 攒上再查，见 SessionPolicy 和 ensure_warm；
+            // 暖不上也照常查。
+            route.rotate_if_due(&self.config);
+            let session = route.generation();
             self.ensure_warm(&route, region).await;
             let url = region.pickup_message_url();
             let outbound = Outbound {
@@ -1183,6 +1350,9 @@ impl AppleClient {
                 }
                 Err(ApiError::Blocked(detail)) => {
                     self.forget_warm(&route, region).await;
+                    if self.config.reset_session_on_block {
+                        route.renew_session(&self.config, session);
+                    }
                     let cooldown = self.record_block(&route, region, probing).await;
                     let who = if multi {
                         format!("线路 {} ", route.label)
@@ -1233,7 +1403,7 @@ impl AppleClient {
         let route = self.primary().await;
         self.throttle(&route).await;
         let fetched = route
-            .http
+            .http()
             .fetch(
                 &region.bag_url(),
                 &[],
@@ -1290,11 +1460,12 @@ impl AppleClient {
             scope,
             parts,
         } = *req;
+        let http = route.http();
         let started = Instant::now();
         let mut record = RequestRecord {
             at_ms: now_ms(),
             kind: "pickup",
-            transport: route.http.label(),
+            transport: http.label(),
             route: route.label.clone(),
             locale: region.locale.to_string(),
             store: scope.store(),
@@ -1304,13 +1475,12 @@ impl AppleClient {
             http_version: None,
             duration_ms: 0,
             outcome: String::new(),
-            cookies_sent: route.http.cookie_names_for(url),
+            cookies_sent: http.cookie_names_for(url),
             cookies_after: Vec::new(),
             final_url: None,
         };
 
-        let sent = route
-            .http
+        let sent = http
             .fetch(
                 url,
                 query,
@@ -1319,7 +1489,11 @@ impl AppleClient {
             )
             .await;
         let fetched = match sent {
-            Ok(fetched) => fetched,
+            Ok(fetched) => {
+                // 只要 Apple 回了话就算这个会话用掉一次，被拦的那次也算。
+                route.count_request();
+                fetched
+            }
             Err(err) => {
                 record.duration_ms = started.elapsed().as_millis() as u64;
                 record.outcome = "transport".into();
@@ -1335,7 +1509,7 @@ impl AppleClient {
         let content_type = fetched.content_type;
         let body = fetched.body;
         record.duration_ms = started.elapsed().as_millis() as u64;
-        record.cookies_after = route.http.cookie_names_for(url);
+        record.cookies_after = http.cookie_names_for(url);
 
         // 先看状态码：拦截页的响应体读到一半失败，也仍然是「被拦」，不能降级成网络错误。
         if let Some(err) = classify_status(status) {
@@ -2199,7 +2373,11 @@ mod tests {
     fn accept_encoding_与_chrome_一致且排在_accept_language_之前() {
         let region = crate::model::region_by_locale("en_US").unwrap();
         for headers in [
-            api_headers(&RequestProfile::chrome(), region, "https://www.apple.com/shop/buy-iphone"),
+            api_headers(
+                &RequestProfile::chrome(),
+                region,
+                "https://www.apple.com/shop/buy-iphone",
+            ),
             navigation_headers(&RequestProfile::chrome(), region),
         ] {
             let out = with_chrome_accept_encoding(headers);
@@ -2229,12 +2407,119 @@ mod tests {
     }
 
     #[test]
+    fn 会话上限按抖动抽签且不低于一次() {
+        let policy = SessionPolicy {
+            max_requests: 20,
+            max_age: Duration::from_secs(1000),
+            jitter: 0.3,
+        };
+        assert_eq!(policy.limit(0.0), (20, Duration::from_secs(1000)));
+        let (requests, age) = policy.limit(0.999_999);
+        assert_eq!(requests, 14);
+        assert!(age >= Duration::from_secs(700) && age < Duration::from_secs(701));
+        // 抖动比例越界时夹到 [0, 1]，上限再小也至少放一次。
+        let wild = SessionPolicy {
+            max_requests: 1,
+            max_age: Duration::from_secs(10),
+            jitter: 5.0,
+        };
+        assert_eq!(wild.limit(0.99).0, 1);
+    }
+
+    #[test]
+    fn 会话用满请求数或时长就到期() {
+        let policy = SessionPolicy {
+            max_requests: 3,
+            max_age: Duration::from_secs(60),
+            jitter: 0.0,
+        };
+        let t0 = Instant::now();
+        let mut s = SessionState::new(Some(&policy), t0, 0.5);
+        assert!(!s.due(t0));
+        s.requests = 3;
+        assert!(s.due(t0), "请求数到了上限");
+        let s = SessionState::new(Some(&policy), t0, 0.5);
+        assert!(!s.due(t0 + Duration::from_secs(59)));
+        assert!(s.due(t0 + Duration::from_secs(60)), "时长到了上限");
+
+        let renewed = s.renewed(Some(&policy), t0 + Duration::from_secs(60), 0.5);
+        assert_eq!(renewed.generation, 1);
+        assert_eq!(renewed.requests, 0);
+        assert!(!renewed.due(t0 + Duration::from_secs(60)));
+
+        // 不开策略就永远不到期。
+        let mut off = SessionState::new(None, t0, 0.5);
+        off.requests = u32::MAX;
+        assert!(!off.due(t0 + Duration::from_secs(86_400)));
+    }
+
+    #[test]
+    fn 各线路的会话上限互不相同() {
+        // 同一时刻建好的线路如果上限一样，就会像 2026-10-25 那样一起撞线。
+        let config = ClientConfig {
+            direct_route: false,
+            session: Some(SessionPolicy {
+                max_requests: 1000,
+                max_age: Duration::from_secs(3600),
+                jitter: 0.5,
+            }),
+            ..ClientConfig::default()
+        };
+        let proxies: Vec<String> = (0..20)
+            .map(|i| format!("http://127.0.0.1:{}", 9000 + i))
+            .collect();
+        let routes = build_routes(&config, &proxies).unwrap();
+        let limits: std::collections::HashSet<u32> = routes
+            .iter()
+            .map(|r| r.lock_session().limit.unwrap().0)
+            .collect();
+        assert!(limits.len() > 10, "{limits:?}");
+    }
+
+    #[test]
+    fn 换会话只换一次且换掉cookie罐() {
+        let config = ClientConfig {
+            direct_route: false,
+            ..ClientConfig::default()
+        };
+        let routes = build_routes(&config, &["http://127.0.0.1:8080".into()]).unwrap();
+        let route = &routes[0];
+        let url = "https://www.apple.com/shop/retail/pickup-message";
+        match &route.http() {
+            Http::Rustls { jar, .. } => {
+                jar.add_cookie_str("dssid2=x; Path=/", &url.parse().unwrap())
+            }
+            #[cfg(feature = "chrome-tls")]
+            Http::Chrome { jar, .. } => jar.add("dssid2=x; Path=/", url),
+        }
+        assert_eq!(route.http().cookie_names_for(url), ["dssid2"]);
+
+        let generation = route.generation();
+        assert!(route.renew_session(&config, generation));
+        assert_eq!(route.generation(), generation + 1);
+        assert!(
+            route.http().cookie_names_for(url).is_empty(),
+            "新会话的罐是空的"
+        );
+        // 同一轮里晚到的被拦结果拿的是旧代号，不能把刚换好的会话再换掉。
+        assert!(!route.renew_session(&config, generation));
+        assert_eq!(route.generation(), generation + 1);
+    }
+
+    #[test]
     fn 关掉直连且没有代理时报错() {
-        let config = ClientConfig { direct_route: false, ..ClientConfig::default() };
+        let config = ClientConfig {
+            direct_route: false,
+            ..ClientConfig::default()
+        };
         assert!(build_routes(&config, &[]).is_err());
         let routes = build_routes(&config, &["http://127.0.0.1:8080".into()]).unwrap();
-        assert_eq!(routes.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["proxy#1"]);
-        let with_direct = build_routes(&ClientConfig::default(), &["http://127.0.0.1:8080".into()]).unwrap();
+        assert_eq!(
+            routes.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
+            ["proxy#1"]
+        );
+        let with_direct =
+            build_routes(&ClientConfig::default(), &["http://127.0.0.1:8080".into()]).unwrap();
         assert_eq!(with_direct[0].label, "direct");
     }
 
