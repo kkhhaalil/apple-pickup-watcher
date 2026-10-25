@@ -454,10 +454,13 @@ impl std::fmt::Debug for Route {
     }
 }
 
-/// 直连排第一，之后每个代理一条线路。空白项跳过；地址不合法就整体报错，
+/// 直连排第一（`direct_route` 关闭时没有），之后每个代理一条线路。空白项跳过；地址不合法就整体报错，
 /// 而不是悄悄少一条线路让用户以为代理在生效。
 fn build_routes(config: &ClientConfig, proxies: &[String]) -> Result<Vec<Arc<Route>>, ApiError> {
-    let mut routes = vec![Arc::new(Route::build(config, "direct".into(), None)?)];
+    let mut routes = Vec::new();
+    if config.direct_route {
+        routes.push(Arc::new(Route::build(config, "direct".into(), None)?));
+    }
     let mut n = 0usize;
     for proxy in proxies {
         let proxy = proxy.trim();
@@ -471,6 +474,11 @@ fn build_routes(config: &ClientConfig, proxies: &[String]) -> Result<Vec<Arc<Rou
             format!("proxy#{n}"),
             Some(proxy),
         )?));
+    }
+    if routes.is_empty() {
+        return Err(ApiError::Transport(
+            "关闭了直连线路，但代理列表为空：没有任何出口可用".into(),
+        ));
     }
     Ok(routes)
 }
@@ -613,6 +621,11 @@ pub struct ClientConfig {
     /// 换下一条继续查，见 [`AppleClient::query`]。Apple 的配额按出口 IP 计，多一条
     /// 线路就多一份配额 —— 这是 issue #37 要的。为空则只有直连。
     pub proxies: Vec<String>,
+    /// 是否把本机直连也作为一条出口线路（排在最前）。默认开，和上游行为一致。
+    ///
+    /// 服务端批量扫描时应当关掉：否则服务器自己的 IP 也会轮到，而它通常就是
+    /// 最先被风控盯上、又最不能被封的那个出口。关掉时代理列表不能为空。
+    pub direct_route: bool,
 }
 
 impl Default for ClientConfig {
@@ -626,6 +639,7 @@ impl Default for ClientConfig {
             transport: Transport::default_for_build(),
             budget: Budget::default(),
             proxies: Vec::new(),
+            direct_route: true,
         }
     }
 }
@@ -736,10 +750,12 @@ impl AppleClient {
             .collect()
     }
 
-    /// 直连那条线路。契约测试、诊断命令看 cookie 和协商结果时用它。
+    /// 排在最前的线路（通常是直连；关掉直连时是第一个代理）。契约测试、诊断命令看
+    /// cookie 和协商结果时用它。
     async fn primary(&self) -> Arc<Route> {
         let routes = self.routes.read().await;
-        Arc::clone(routes.first().expect("至少有直连一条线路"))
+        // build_routes 保证至少有一条线路。
+        Arc::clone(routes.first().expect("至少有一条线路"))
     }
 
     /// 当前的请求预算（每条线路各一份）。
@@ -1039,10 +1055,31 @@ impl AppleClient {
         if store_number.is_empty() {
             return Err(ApiError::Transport("门店编号为空".into()));
         }
-        let body = self
+        let (body, _) = self
             .query(region, PickupScope::Store(store_number.to_string()), parts)
             .await?;
         parse_pickup_message(&body, store_number)
+    }
+
+    /// 和 [`Self::pickup_message`] 相同，另外交出原始响应、实际走的线路与门店元数据。
+    pub async fn pickup_store_detailed(
+        &self,
+        region: &Region,
+        store_number: &str,
+        parts: &[String],
+    ) -> Result<PickupDetail, ApiError> {
+        if store_number.is_empty() {
+            return Err(ApiError::Transport("门店编号为空".into()));
+        }
+        let (raw, route) = self
+            .query(region, PickupScope::Store(store_number.to_string()), parts)
+            .await?;
+        let store = parse_pickup_message(&raw, store_number)?;
+        let meta = parse_store_meta(&raw)
+            .into_iter()
+            .filter(|m| m.store_number == store_number)
+            .collect();
+        Ok(PickupDetail { stores: vec![store], meta, raw, route })
     }
 
     /// 一次查询 `location` 周边所有门店里 `parts` 各型号的可取货状态。
@@ -1059,10 +1096,32 @@ impl AppleClient {
         if location.trim().is_empty() {
             return Err(ApiError::Transport("查询地点为空".into()));
         }
-        let body = self
+        let (body, _) = self
             .query(region, PickupScope::Nearby(location.to_string()), parts)
             .await?;
         parse_pickup_stores(&body)
+    }
+
+    /// 和 [`Self::pickup_message_nearby`] 相同，另外交出原始响应、实际走的线路与门店
+    /// 元数据（坐标、距离、`pickupSearchQuote`）。
+    ///
+    /// 服务端用：原始响应用来存快照、事后重新解释，线路名用来按出口统计拦截率 ——
+    /// 这两样从 [`Self::recent_requests`] 里只能事后猜。
+    pub async fn pickup_nearby_detailed(
+        &self,
+        region: &Region,
+        location: &str,
+        parts: &[String],
+    ) -> Result<PickupDetail, ApiError> {
+        if location.trim().is_empty() {
+            return Err(ApiError::Transport("查询地点为空".into()));
+        }
+        let (raw, route) = self
+            .query(region, PickupScope::Nearby(location.to_string()), parts)
+            .await?;
+        let stores = parse_pickup_stores(&raw)?;
+        let meta = parse_store_meta(&raw);
+        Ok(PickupDetail { stores, meta, raw, route })
     }
 
     /// 两种范围共用的一次取货查询：冷却检查、暖场、发请求、被拦登记。
@@ -1071,7 +1130,7 @@ impl AppleClient {
         region: &Region,
         scope: PickupScope,
         parts: &[String],
-    ) -> Result<Vec<u8>, ApiError> {
+    ) -> Result<(Vec<u8>, String), ApiError> {
         if parts.is_empty() {
             return Err(ApiError::Transport("零件号列表为空".into()));
         }
@@ -1120,7 +1179,7 @@ impl AppleClient {
             match result {
                 Ok(body) => {
                     self.clear_block(&route, region, probing).await;
-                    return Ok(body);
+                    return Ok((body, route.label.clone()));
                 }
                 Err(ApiError::Blocked(detail)) => {
                     self.forget_warm(&route, region).await;
@@ -1506,7 +1565,7 @@ impl Http {
                 let resp = client
                     .get(url)
                     .query(query)
-                    .headers(headers)
+                    .headers(with_chrome_accept_encoding(headers))
                     .send()
                     .await
                     .map_err(|e| ApiError::Transport(e.to_string()))?;
@@ -1576,6 +1635,47 @@ impl Http {
             }
         }
     }
+}
+
+/// Chrome 实际发送的 `accept-encoding`。
+///
+/// 不显式写的话，wreq 内部的 tower-http 会按开启的解码 feature 自动补一个 `gzip,br`
+/// （无空格、少 deflate / zstd），和自称的 Chrome 对不上，是一眼可辨的特征。
+/// 这四种都要能解：wreq 的 `deflate`、`zstd` feature 必须一起开。
+#[cfg(feature = "chrome-tls")]
+const CHROME_ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
+
+/// 把 `accept-encoding` 插到 `accept-language` 前面 —— Chrome 里就是这个顺序，
+/// 头的先后也是指纹的一部分。调用方已经写了就不动。
+#[cfg(feature = "chrome-tls")]
+fn with_chrome_accept_encoding(headers: HeaderMap) -> HeaderMap {
+    let key = reqwest::header::ACCEPT_ENCODING;
+    if headers.contains_key(&key) {
+        return headers;
+    }
+    let value = HeaderValue::from_static(CHROME_ACCEPT_ENCODING);
+    let mut out = HeaderMap::with_capacity(headers.len() + 1);
+    let mut inserted = false;
+    let mut last: Option<HeaderName> = None;
+    for (name, v) in headers {
+        // HeaderMap 的 IntoIterator 对同名多值只在第一项给出名字。
+        let name = match name {
+            Some(n) => {
+                last = Some(n.clone());
+                n
+            }
+            None => last.clone().expect("同名多值前必有名字"),
+        };
+        if !inserted && name == reqwest::header::ACCEPT_LANGUAGE {
+            out.append(key.clone(), value.clone());
+            inserted = true;
+        }
+        out.append(name, v);
+    }
+    if !inserted {
+        out.append(key, value);
+    }
+    out
 }
 
 fn content_type_of(headers: &HeaderMap) -> String {
@@ -1803,6 +1903,73 @@ pub struct StoreAvailability {
     pub parts: std::collections::BTreeMap<String, PartStatus>,
 }
 
+/// 一次取货查询的完整结果，见 [`AppleClient::pickup_nearby_detailed`]。
+#[derive(Debug, Clone)]
+pub struct PickupDetail {
+    pub stores: Vec<StoreAvailability>,
+    /// 与 `stores` 同序；某家店的元数据解析不出来时它不在这里，而不是整次失败。
+    pub meta: Vec<StoreMeta>,
+    /// 原始响应体（已解压）。
+    pub raw: Vec<u8>,
+    /// 实际走的出口线路：`direct` 或 `proxy#N`。
+    pub route: String,
+}
+
+/// 门店的附加信息。全部可空：这些字段不参与三态判定，缺了也不该让查询失败。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoreMeta {
+    pub store_number: String,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    /// 到查询地点的距离（`storedistance`），单位随地区，美国站是英里。
+    pub distance: Option<f64>,
+    /// 零件号 → `pickupSearchQuote`（如 "Today at University Village"、"Currently unavailable"）。
+    pub quotes: std::collections::BTreeMap<String, String>,
+}
+
+/// 从取货响应里宽松地取出门店元数据。和 [`parse_pickup_stores`] 不同，这里不做
+/// 任何结构校验：拿不到的字段就是 `None`，三态判定的严格性不受影响。
+pub fn parse_store_meta(raw: &[u8]) -> Vec<StoreMeta> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let body = &v["body"];
+    let stores = body["stores"]
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .or_else(|| body["content"]["pickupMessage"]["stores"].as_array());
+    let num = |x: &serde_json::Value| match x {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    };
+    stores
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let store_number = s["storeNumber"].as_str()?.to_string();
+            let quotes = s["partsAvailability"]
+                .as_object()
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|(k, p)| {
+                            Some((k.clone(), p["pickupSearchQuote"].as_str()?.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(StoreMeta {
+                store_number,
+                latitude: num(&s["storelatitude"]),
+                longitude: num(&s["storelongitude"]),
+                distance: num(&s["storedistance"]),
+                quotes,
+            })
+        })
+        .collect()
+}
+
 // ---- 响应结构。只声明用得到的字段：Apple 的响应有几十个字段，全部映射既无必要，
 // ---- 也更容易随接口调整而整体失配。
 
@@ -2026,6 +2193,50 @@ pub fn availability_from(pickup_display: &str) -> Availability {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "chrome-tls")]
+    #[test]
+    fn accept_encoding_与_chrome_一致且排在_accept_language_之前() {
+        let region = crate::model::region_by_locale("en_US").unwrap();
+        for headers in [
+            api_headers(&RequestProfile::chrome(), region, "https://www.apple.com/shop/buy-iphone"),
+            navigation_headers(&RequestProfile::chrome(), region),
+        ] {
+            let out = with_chrome_accept_encoding(headers);
+            let names: Vec<&str> = out.keys().map(|k| k.as_str()).collect();
+            let ae = names.iter().position(|n| *n == "accept-encoding").unwrap();
+            assert_eq!(names[ae + 1], "accept-language", "{names:?}");
+            assert_eq!(out["accept-encoding"], "gzip, deflate, br, zstd");
+        }
+    }
+
+    #[test]
+    fn 宽松解析门店元数据() {
+        let raw = br#"{"head":{"status":"200"},"body":{"stores":[
+            {"storeNumber":"R072","storelatitude":47.6687,"storelongitude":"-122.2995","storedistance":4.42,
+             "partsAvailability":{"MK1F4LL/A":{"pickupDisplay":"unavailable","pickupSearchQuote":"Currently unavailable"}}},
+            {"storeNumber":"R003","partsAvailability":{}},
+            {"noNumber":true}
+        ]}}"#;
+        let meta = parse_store_meta(raw);
+        assert_eq!(meta.len(), 2);
+        assert_eq!(meta[0].latitude, Some(47.6687));
+        assert_eq!(meta[0].longitude, Some(-122.2995), "字符串形式的数字也要认");
+        assert_eq!(meta[0].distance, Some(4.42));
+        assert_eq!(meta[0].quotes["MK1F4LL/A"], "Currently unavailable");
+        assert_eq!(meta[1].latitude, None);
+        assert!(parse_store_meta(b"not json").is_empty());
+    }
+
+    #[test]
+    fn 关掉直连且没有代理时报错() {
+        let config = ClientConfig { direct_route: false, ..ClientConfig::default() };
+        assert!(build_routes(&config, &[]).is_err());
+        let routes = build_routes(&config, &["http://127.0.0.1:8080".into()]).unwrap();
+        assert_eq!(routes.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["proxy#1"]);
+        let with_direct = build_routes(&ClientConfig::default(), &["http://127.0.0.1:8080".into()]).unwrap();
+        assert_eq!(with_direct[0].label, "direct");
+    }
 
     const LOCALE: &str = "zh_HK";
 
