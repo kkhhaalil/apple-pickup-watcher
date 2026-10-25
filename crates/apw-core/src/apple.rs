@@ -310,6 +310,101 @@ impl SessionPolicy {
     }
 }
 
+/// 每条线路用满一班就主动歇一阵，不等 Apple 来拦。
+///
+/// 2026-10-25 的几轮实测里，每个出口 IP 大约有 31 次取货查询的额度，用完就被拦
+/// 30～35 分钟；在 23～46 次/小时这个范围里，额度不会随时间慢慢恢复，降速只能
+/// 推迟撞线。这个策略要验证的是另一种可能：不等被拦，在额度用完前主动停下，
+/// 歇够惩罚时长之后额度能不能完整恢复。如果能，IP 就可以轮班用。
+///
+/// 第一班的上限在 `[1, max_requests]` 里随机取，让同一时刻建好的线路错开进入
+/// 休息；之后每一班在 `[(1 - jitter) × max_requests, max_requests]` 里取，休息
+/// 时长在 `[rest, (1 + jitter) × rest]` 里取 —— 抖动只往安全的方向偏。
+///
+/// 默认不开（[`ClientConfig::rest`] 为 `None`）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RestPolicy {
+    /// 一班最多发多少次取货查询。
+    pub max_requests: u32,
+    /// 每班之后歇多久。
+    pub rest: Duration,
+    /// 抖动比例，0～1。
+    pub jitter: f64,
+}
+
+impl RestPolicy {
+    fn shift(&self, draw: f64) -> u32 {
+        let scale = 1.0 - self.jitter.clamp(0.0, 1.0) * draw.clamp(0.0, 1.0);
+        ((f64::from(self.max_requests) * scale).round() as u32).max(1)
+    }
+
+    /// 第一班：随机相位。
+    fn first_shift(&self, draw: f64) -> u32 {
+        ((f64::from(self.max_requests) * draw.clamp(0.0, 1.0)).ceil() as u32)
+            .clamp(1, self.max_requests.max(1))
+    }
+
+    fn rest_for(&self, draw: f64) -> Duration {
+        self.rest
+            .mul_f64(1.0 + self.jitter.clamp(0.0, 1.0) * draw.clamp(0.0, 1.0))
+    }
+}
+
+/// 一条线路的轮班账本。纯状态，不碰网络，便于单测。
+#[derive(Debug, Clone, PartialEq)]
+struct RestState {
+    /// 这一班已经发出的取货查询数。
+    requests: u32,
+    /// 这一班的上限；`None` 表示不轮班。
+    limit: Option<u32>,
+    /// 正在休息时，歇到什么时候。
+    until: Option<Instant>,
+}
+
+impl RestState {
+    fn new(policy: Option<&RestPolicy>, draw: f64) -> Self {
+        Self {
+            requests: 0,
+            limit: policy.map(|p| p.first_shift(draw)),
+            until: None,
+        }
+    }
+
+    /// 还要歇多久；不在休息就是 `None`。
+    fn resting(&self, now: Instant) -> Option<Duration> {
+        self.until
+            .filter(|until| now < *until)
+            .map(|until| until - now)
+    }
+
+    /// 记一次取货查询。这一班用满了就开始休息，返回这次休息的时长。
+    fn count(
+        &mut self,
+        policy: Option<&RestPolicy>,
+        now: Instant,
+        draws: (f64, f64),
+    ) -> Option<Duration> {
+        let (policy, limit) = (policy?, self.limit?);
+        self.requests += 1;
+        if self.requests < limit {
+            return None;
+        }
+        let rest = policy.rest_for(draws.0);
+        self.until = Some(now + rest);
+        self.requests = 0;
+        self.limit = Some(policy.shift(draws.1));
+        Some(rest)
+    }
+
+    /// 被拦了：Apple 的惩罚期本身就是一次休息，冷却结束后从新的一班算起。
+    fn restart(&mut self, policy: Option<&RestPolicy>, draw: f64) {
+        if let Some(policy) = policy {
+            self.requests = 0;
+            self.limit = Some(policy.shift(draw));
+        }
+    }
+}
+
 /// 令牌桶的当前状态。`tokens` 允许为负：负数表示已经预约出去、要等恢复的额度。
 #[derive(Debug)]
 struct BudgetState {
@@ -447,6 +542,8 @@ enum RouteAvailability {
     /// 冷却刚结束，已有一次探测在飞，先别往这条线路再塞请求。
     Probing,
     Cooling(Duration),
+    /// 按 [`RestPolicy`] 主动休息中。
+    Resting(Duration),
 }
 
 /// 一条出口线路：直连，或经某个代理。
@@ -466,6 +563,7 @@ struct Route {
     /// 正在飞的请求拿着旧的克隆跑完即可。
     http: std::sync::RwLock<Http>,
     session: std::sync::Mutex<SessionState>,
+    rest: std::sync::Mutex<RestState>,
     warm: Mutex<HashMap<String, WarmState>>,
     blocks: Mutex<BlockTracker>,
     budget: Mutex<BudgetState>,
@@ -483,6 +581,7 @@ impl Route {
                 Instant::now(),
                 rand::random(),
             )),
+            rest: std::sync::Mutex::new(RestState::new(config.rest.as_ref(), rand::random())),
             warm: Mutex::new(HashMap::new()),
             blocks: Mutex::new(BlockTracker::default()),
             budget: Mutex::new(BudgetState::new(&config.budget, Instant::now())),
@@ -506,9 +605,23 @@ impl Route {
         self.session.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 记一次取货查询。
-    fn count_request(&self) {
+    fn lock_rest(&self) -> std::sync::MutexGuard<'_, RestState> {
+        self.rest.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 记一次取货查询：会话和轮班各记一笔。
+    fn count_request(&self, config: &ClientConfig) {
         self.lock_session().requests += 1;
+        self.lock_rest().count(
+            config.rest.as_ref(),
+            Instant::now(),
+            (rand::random(), rand::random()),
+        );
+    }
+
+    /// 轮班休息中还要歇多久。
+    fn resting(&self, now: Instant) -> Option<Duration> {
+        self.lock_rest().resting(now)
     }
 
     /// 如果当前还是第 `generation` 个会话，就丢掉它换一个新的，返回是否真的换了。
@@ -767,6 +880,8 @@ pub struct ClientConfig {
     /// 两次探测都先用旧罐重新暖场，照样 541，直到第三次探测（又过了 20 分钟）才通过；
     /// 而 worker 重启、换了新罐的线路立刻就通了。
     pub reset_session_on_block: bool,
+    /// 线路轮班策略，见 [`RestPolicy`]。`None`（默认）表示不轮班。
+    pub rest: Option<RestPolicy>,
 }
 
 impl Default for ClientConfig {
@@ -783,6 +898,7 @@ impl Default for ClientConfig {
             direct_route: true,
             session: None,
             reset_session_on_block: true,
+            rest: None,
         }
     }
 }
@@ -1130,7 +1246,11 @@ impl AppleClient {
             if tried.contains(&route.label) {
                 continue;
             }
-            match route.blocks.lock().await.availability(region.locale, now) {
+            let availability = match route.resting(now) {
+                Some(left) => RouteAvailability::Resting(left),
+                None => route.blocks.lock().await.availability(region.locale, now),
+            };
+            match availability {
                 RouteAvailability::Free => {
                     let wait = route
                         .budget
@@ -1159,6 +1279,12 @@ impl AppleClient {
         // 只有直连一条：沿用原来的提示，桌面端和测试都认这两句话。
         if routes.len() == 1 {
             let route = &routes[0];
+            if let Some(left) = route.resting(Instant::now()) {
+                return Err(ApiError::Blocked(format!(
+                    "按轮班策略休息中，{}后继续",
+                    human_duration(left)
+                )));
+            }
             return match route
                 .blocks
                 .lock()
@@ -1175,6 +1301,10 @@ impl AppleClient {
             match state {
                 RouteAvailability::Cooling(left) => {
                     parts.push(format!("{label} {}", human_duration(*left)));
+                    soonest = Some(soonest.map_or(*left, |s| s.min(*left)));
+                }
+                RouteAvailability::Resting(left) => {
+                    parts.push(format!("{label} 休息 {}", human_duration(*left)));
                     soonest = Some(soonest.map_or(*left, |s| s.min(*left)));
                 }
                 RouteAvailability::Probing => parts.push(format!("{label} 探测中")),
@@ -1353,6 +1483,9 @@ impl AppleClient {
                     if self.config.reset_session_on_block {
                         route.renew_session(&self.config, session);
                     }
+                    route
+                        .lock_rest()
+                        .restart(self.config.rest.as_ref(), rand::random());
                     let cooldown = self.record_block(&route, region, probing).await;
                     let who = if multi {
                         format!("线路 {} ", route.label)
@@ -1491,7 +1624,7 @@ impl AppleClient {
         let fetched = match sent {
             Ok(fetched) => {
                 // 只要 Apple 回了话就算这个会话用掉一次，被拦的那次也算。
-                route.count_request();
+                route.count_request(&self.config);
                 fetched
             }
             Err(err) => {
@@ -2504,6 +2637,58 @@ mod tests {
         // 同一轮里晚到的被拦结果拿的是旧代号，不能把刚换好的会话再换掉。
         assert!(!route.renew_session(&config, generation));
         assert_eq!(route.generation(), generation + 1);
+    }
+
+    #[test]
+    fn 轮班第一班随机相位_之后按抖动取上限并往长里歇() {
+        let policy = RestPolicy {
+            max_requests: 25,
+            rest: Duration::from_secs(35 * 60),
+            jitter: 0.2,
+        };
+        assert_eq!(policy.first_shift(0.0), 1);
+        assert_eq!(policy.first_shift(0.5), 13);
+        assert_eq!(policy.first_shift(0.999_999), 25);
+        assert_eq!(policy.shift(0.0), 25);
+        assert_eq!(policy.shift(0.999_999), 20);
+        assert_eq!(policy.rest_for(0.0), Duration::from_secs(35 * 60));
+        assert!(policy.rest_for(0.999_999) <= Duration::from_secs(42 * 60));
+        assert!(policy.rest_for(0.999_999) > Duration::from_secs(41 * 60));
+    }
+
+    #[test]
+    fn 用满一班就休息_歇完从新一班算起() {
+        let policy = RestPolicy {
+            max_requests: 3,
+            rest: Duration::from_secs(60),
+            jitter: 0.0,
+        };
+        let t0 = Instant::now();
+        let mut s = RestState::new(Some(&policy), 0.999_999);
+        assert_eq!(s.limit, Some(3));
+        assert_eq!(s.count(Some(&policy), t0, (0.0, 0.0)), None);
+        assert_eq!(s.count(Some(&policy), t0, (0.0, 0.0)), None);
+        assert_eq!(s.resting(t0), None);
+        assert_eq!(
+            s.count(Some(&policy), t0, (0.0, 0.0)),
+            Some(Duration::from_secs(60)),
+            "第三次用满这一班"
+        );
+        assert_eq!(s.resting(t0), Some(Duration::from_secs(60)));
+        assert_eq!(s.resting(t0 + Duration::from_secs(60)), None, "歇够就能用");
+        assert_eq!(s.requests, 0);
+
+        // 被拦：惩罚期就是休息，计数清零。
+        s.requests = 2;
+        s.restart(Some(&policy), 0.0);
+        assert_eq!(s.requests, 0);
+
+        // 不开策略：永远不休息。
+        let mut off = RestState::new(None, 0.5);
+        for _ in 0..1000 {
+            assert_eq!(off.count(None, t0, (0.0, 0.0)), None);
+        }
+        assert_eq!(off.resting(t0), None);
     }
 
     #[test]

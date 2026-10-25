@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use apw_core::apple::{
-    ApiError, AppleClient, ClientConfig, RequestProfile, SessionPolicy, Transport, WarmPage,
+    ApiError, AppleClient, ClientConfig, RequestProfile, RestPolicy, SessionPolicy, Transport,
+    WarmPage,
 };
 use apw_core::model::{Category, Family, Region};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -449,6 +450,30 @@ async fn 会话用满后换新罐重新暖场() {
             .iter()
             .all(|p| p.header("cookie") == Some("dssid2=secret-value"))
     );
+}
+
+#[tokio::test]
+async fn 用满一班的线路主动休息且不发请求() {
+    let apple = FakeApple::start(healthy).await;
+    let region = apple.region();
+    let client = fast(ClientConfig {
+        rest: Some(RestPolicy {
+            max_requests: 1,
+            rest: Duration::from_secs(3600),
+            jitter: 0.0,
+        }),
+        ..ClientConfig::default()
+    });
+    let parts = ["MG724CH/A".to_string()];
+    client
+        .pickup_message(region, "R683", &parts)
+        .await
+        .expect("第一班的第一次查询照常发");
+    match client.pickup_message(region, "R683", &parts).await {
+        Err(ApiError::Blocked(detail)) => assert!(detail.contains("休息"), "{detail}"),
+        other => panic!("用满一班后应当休息，实际是 {other:?}"),
+    }
+    assert_eq!(apple.requests(PICKUP_PATH).len(), 1, "休息中不该有出站请求");
 }
 
 #[tokio::test]
