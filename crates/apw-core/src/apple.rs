@@ -226,6 +226,19 @@ const BLOCK_COOLDOWNS: [Duration; 4] = [
     Duration::from_secs(30 * 60),
 ];
 
+/// 代理连不上（连接、握手失败或超时）后这条线路先停多久：首次 1 分钟，恢复后再连不上
+/// 依次延长到 2、5、10 分钟，连通一次就清零。
+///
+/// 2026-10-25 跑 250 个代理时有一个代理一直 ProxyConnect：它从不发出成功的请求，
+/// 轮班计数涨不上去、令牌桶也一直显得最满，于是一直排在最前面被选中；每次查询都在它
+/// 上面把重试和额度等待耗完（一次 60～120 秒），并发名额就这样被它一个个占住。
+const PROXY_DOWN_COOLDOWNS: [Duration; 4] = [
+    Duration::from_secs(60),
+    Duration::from_secs(2 * 60),
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(10 * 60),
+];
+
 /// 保留最近多少条出站请求记录，供诊断命令和日志使用。
 const RECENT_RECORDS: usize = 256;
 
@@ -544,6 +557,16 @@ enum RouteAvailability {
     Cooling(Duration),
     /// 按 [`RestPolicy`] 主动休息中。
     Resting(Duration),
+    /// 代理连不上，暂停中，见 [`PROXY_DOWN_COOLDOWNS`]。
+    Down(Duration),
+}
+
+/// 代理线路连不上之后的暂停状态。
+#[derive(Debug, Default)]
+struct DownState {
+    until: Option<Instant>,
+    /// 连续连不上的次数，对应 [`PROXY_DOWN_COOLDOWNS`] 的下标。
+    strikes: usize,
 }
 
 /// 一条出口线路：直连，或经某个代理。
@@ -571,6 +594,7 @@ struct Route {
     /// 才真正预约，挑线路时得先算上，否则同时进来的几个查询看到的是同一份令牌桶，
     /// 会一起挤到「看上去最快」的那条线路上排队。
     pending: AtomicU32,
+    down: std::sync::Mutex<DownState>,
 }
 
 /// 一次查询占着某条线路的凭据，查询在这条线路上结束（成功、失败或被取消）时归还。
@@ -606,6 +630,7 @@ impl Route {
             blocks: Mutex::new(BlockTracker::default()),
             budget: Mutex::new(BudgetState::new(&config.budget, Instant::now())),
             pending: AtomicU32::new(0),
+            down: std::sync::Mutex::new(DownState::default()),
         })
     }
 
@@ -643,6 +668,36 @@ impl Route {
     /// 轮班休息中还要歇多久。
     fn resting(&self, now: Instant) -> Option<Duration> {
         self.lock_rest().resting(now)
+    }
+
+    fn lock_down(&self) -> std::sync::MutexGuard<'_, DownState> {
+        self.down.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 代理连不上、暂停中还要停多久。
+    fn down_for(&self, now: Instant) -> Option<Duration> {
+        self.lock_down()
+            .until
+            .filter(|until| now < *until)
+            .map(|until| until - now)
+    }
+
+    /// 记一次代理连不上，返回这次暂停多久。并发的几次失败落在同一段暂停里只算一次。
+    fn mark_down(&self, now: Instant) -> Duration {
+        let mut down = self.lock_down();
+        if let Some(until) = down.until
+            && now < until
+        {
+            return until - now;
+        }
+        let pause = PROXY_DOWN_COOLDOWNS[down.strikes.min(PROXY_DOWN_COOLDOWNS.len() - 1)];
+        down.strikes += 1;
+        down.until = Some(now + pause);
+        pause
+    }
+
+    fn mark_up(&self) {
+        *self.lock_down() = DownState::default();
     }
 
     /// 如果当前还是第 `generation` 个会话，就丢掉它换一个新的，返回是否真的换了。
@@ -1133,11 +1188,13 @@ impl AppleClient {
     /// 3. **失败不影响查询**：暖不上时照常发查询，只是 [`WARM_RETRY_INTERVAL`] 内
     ///    不再重试暖场。让一次辅助请求的失败去决定库存判定，正是这个项目最不该
     ///    有的东西。
-    async fn ensure_warm(&self, route: &Route, region: &Region) {
+    ///
+    /// 返回 `Err` 表示这次暖场连代理都没连上（网络层失败），调用方可以换线路。
+    async fn ensure_warm(&self, route: &Route, region: &Region) -> Result<(), ApiError> {
         let url = match self.config.warm_page {
             WarmPage::Bag => region.bag_url(),
             WarmPage::BuyPage => region.default_buy_page_url(),
-            WarmPage::None => return,
+            WarmPage::None => return Ok(()),
         };
 
         let mut states = route.warm.lock().await;
@@ -1151,12 +1208,12 @@ impl AppleClient {
             };
         }
         if state.warmed {
-            return;
+            return Ok(());
         }
         if let Some(at) = state.last_attempt
             && at.elapsed() < WARM_RETRY_INTERVAL
         {
-            return;
+            return Ok(());
         }
         state.last_attempt = Some(Instant::now());
 
@@ -1189,6 +1246,7 @@ impl AppleClient {
                 MAX_WARM_BYTES,
             )
             .await;
+        let mut failed = None;
         match sent {
             Ok(fetched) => {
                 // 响应体已经读掉（连接才能复用），内容本身用不上。
@@ -1216,11 +1274,16 @@ impl AppleClient {
             Err(err) => {
                 record.outcome = format!("transport: {err}");
                 state.failures = state.failures.saturating_add(1);
+                failed = Some(err);
             }
         }
         record.duration_ms = started.elapsed().as_millis() as u64;
         drop(states);
         self.push_record(record).await;
+        match failed {
+            Some(err @ ApiError::Transport(_)) => Err(err),
+            _ => Ok(()),
+        }
     }
 
     /// 忘掉某地区的暖场标记，下一次会重新取页面。
@@ -1279,19 +1342,23 @@ impl AppleClient {
             if tried.contains(&route.label) {
                 continue;
             }
-            let availability = match route.resting(now) {
-                Some(left) => RouteAvailability::Resting(left),
-                None => route.blocks.lock().await.availability(region.locale, now),
+            let availability = if let Some(left) = route.down_for(now) {
+                RouteAvailability::Down(left)
+            } else if let Some(left) = route.resting(now) {
+                RouteAvailability::Resting(left)
+            } else {
+                route.blocks.lock().await.availability(region.locale, now)
             };
             match availability {
                 RouteAvailability::Free => {
                     // 已经选了这条线路、还没预约额度的查询排在前面，算上它们。
                     let ahead = route.pending.load(Ordering::Relaxed) as usize;
-                    let wait = route
-                        .budget
-                        .lock()
-                        .await
-                        .wait_for(&self.config.budget, now, 1 + ahead);
+                    let wait =
+                        route
+                            .budget
+                            .lock()
+                            .await
+                            .wait_for(&self.config.budget, now, 1 + ahead);
                     ranked.push((i, wait));
                 }
                 other => unavailable.push((route.label.clone(), other)),
@@ -1356,6 +1423,10 @@ impl AppleClient {
                 }
                 RouteAvailability::Resting(left) => {
                     parts.push(format!("{label} 休息 {}", human_duration(*left)));
+                    soonest = Some(soonest.map_or(*left, |s| s.min(*left)));
+                }
+                RouteAvailability::Down(left) => {
+                    parts.push(format!("{label} 连不上 {}", human_duration(*left)));
                     soonest = Some(soonest.map_or(*left, |s| s.min(*left)));
                 }
                 RouteAvailability::Probing => parts.push(format!("{label} 探测中")),
@@ -1512,7 +1583,20 @@ impl AppleClient {
             // 暖不上也照常查。
             route.rotate_if_due(&self.config);
             let session = route.generation();
-            self.ensure_warm(&route, region).await;
+            // 暖场就连不上代理：取货请求多半也一样，直接换下一条，别在这条上再耗重试。
+            if let Err(err) = self.ensure_warm(&route, region).await
+                && route.is_proxy()
+                && multi
+            {
+                if probing {
+                    self.end_probe(&route, region).await;
+                }
+                route.mark_down(Instant::now());
+                let text = describe_proxy_failure(&route, &err);
+                outcomes.push(text.clone());
+                last_err = Some(ApiError::Transport(text));
+                continue;
+            }
             let url = region.pickup_message_url();
             let outbound = Outbound {
                 url: &url,
@@ -1522,10 +1606,12 @@ impl AppleClient {
                 scope: &scope,
                 parts: parts.len(),
             };
-            let result = self.get(&route, &outbound).await;
+            let fail_over = route.is_proxy() && multi;
+            let result = self.get(&route, &outbound, fail_over).await;
 
             match result {
                 Ok(body) => {
+                    route.mark_up();
                     self.clear_block(&route, region, probing).await;
                     return Ok((body, route.label.clone()));
                 }
@@ -1552,10 +1638,11 @@ impl AppleClient {
                 }
                 // 代理连不上、握手失败之类：这条线路的问题，换一条；直连的网络错误
                 // 则照旧直接报出去（换代理解决不了本机断网）。
-                Err(err @ ApiError::Transport(_)) if route.is_proxy() && multi => {
+                Err(err @ ApiError::Transport(_)) if fail_over => {
                     if probing {
                         self.end_probe(&route, region).await;
                     }
+                    route.mark_down(Instant::now());
                     let text = describe_proxy_failure(&route, &err);
                     outcomes.push(text.clone());
                     last_err = Some(ApiError::Transport(text));
@@ -1599,8 +1686,19 @@ impl AppleClient {
     }
 
     /// 执行一次带限速与退避重试的 GET，返回响应体。
-    async fn get(&self, route: &Route, req: &Outbound<'_>) -> Result<Vec<u8>, ApiError> {
-        with_retry(self.config.max_retries, || async {
+    ///
+    /// `fail_over` 为真（还有别的线路可换）时，代理连不上不在这条线路上重试，直接交回去
+    /// 换线路：每次重试都要排这条线路的额度，连不上的代理会把一次查询拖上一两分钟。
+    async fn get(
+        &self,
+        route: &Route,
+        req: &Outbound<'_>,
+        fail_over: bool,
+    ) -> Result<Vec<u8>, ApiError> {
+        let retryable = |err: &ApiError| {
+            err.is_retryable() && !(fail_over && matches!(err, ApiError::Transport(_)))
+        };
+        with_retry_if(self.config.max_retries, retryable, || async {
             // 限速放在重试循环内部：每一次真正的出站请求都要排队，
             // 重试不该成为绕过全局节流的后门。
             self.throttle(route).await;
@@ -2136,10 +2234,24 @@ pub(crate) fn classify_status(code: u16) -> Option<ApiError> {
 /// 带指数退避的重试。只有可自愈的错误才重试，结构不符与业务错误重试多少次都一样。
 ///
 /// 同样是原本两处各写一份：库存查询与购买页抓取的退避逻辑此前逐字相同。
-pub(crate) async fn with_retry<T, F, Fut>(max_retries: u32, mut once: F) -> Result<T, ApiError>
+pub(crate) async fn with_retry<T, F, Fut>(max_retries: u32, once: F) -> Result<T, ApiError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, ApiError>>,
+{
+    with_retry_if(max_retries, ApiError::is_retryable, once).await
+}
+
+/// 同 [`with_retry`]，但由 `retryable` 决定哪些错误值得重试。
+pub(crate) async fn with_retry_if<T, F, Fut, R>(
+    max_retries: u32,
+    retryable: R,
+    mut once: F,
+) -> Result<T, ApiError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ApiError>>,
+    R: Fn(&ApiError) -> bool,
 {
     let mut last_err = None;
 
@@ -2150,7 +2262,7 @@ where
         }
         match once().await {
             Ok(v) => return Ok(v),
-            Err(err) if err.is_retryable() => last_err = Some(err),
+            Err(err) if retryable(&err) => last_err = Some(err),
             Err(err) => return Err(err),
         }
     }

@@ -896,11 +896,44 @@ async fn 代理连不上时换下一条线路且报的是代理的错() {
     assert_eq!(routes[1].0, "proxy#1");
     assert_eq!(routes[1].1, "transport");
 
-    // 直连在冷却，第二次只会去撞那个不通的代理，不会再碰直连。
-    let _ = client.pickup_message(region, "R102", &part).await;
+    // 直连在冷却、不通的代理在暂停，第二次一个请求都不发，并说清各自还要等多久。
+    let err = client
+        .pickup_message(region, "R102", &part)
+        .await
+        .expect_err("两条线路都不可用");
     let routes = pickup_routes(&client.recent_requests().await);
-    assert_eq!(routes.len(), 3, "{routes:?}");
-    assert_eq!(routes[2].0, "proxy#1");
+    assert_eq!(routes.len(), 2, "{routes:?}");
+    let text = err.to_string();
+    assert!(text.contains("proxy#1 连不上"), "{text}");
+}
+
+#[tokio::test]
+async fn 连不上的代理暂停使用且不在它上面重试() {
+    let apple = FakeApple::start(healthy).await;
+    let region = apple.region();
+    let client = fast(ClientConfig {
+        proxies: vec![dead_proxy_url().await],
+        max_retries: 2,
+        ..ClientConfig::default()
+    });
+    let part = ["MG724CH/A".to_string()];
+
+    let started = std::time::Instant::now();
+    for store in ["R101", "R102", "R103", "R104"] {
+        client
+            .pickup_message(region, store, &part)
+            .await
+            .expect("直连是通的");
+    }
+    // 不通的代理最多被碰一次（暖场或取货），之后暂停，不再有人去排它的重试。
+    let records = client.recent_requests().await;
+    let on_proxy: Vec<_> = records.iter().filter(|r| r.route == "proxy#1").collect();
+    assert!(on_proxy.len() <= 1, "{on_proxy:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]
@@ -996,7 +1029,10 @@ async fn 并发查询分散到各条线路而不是挤在最快的那条上排�
     let part = ["MG724CH/A".to_string()];
     // 两条线路的额度各用掉一次，之后谁都得等，其中一条会早几毫秒恢复。
     for store in ["R101", "R102"] {
-        client.pickup_message(region, store, &part).await.expect("先用掉额度");
+        client
+            .pickup_message(region, store, &part)
+            .await
+            .expect("先用掉额度");
     }
 
     let started = std::time::Instant::now();
@@ -1037,14 +1073,20 @@ async fn 所有线路都要等太久时直接报限流而不去排队() {
         ..ClientConfig::default()
     });
     let part = ["MG724CH/A".to_string()];
-    client.pickup_message(region, "R101", &part).await.expect("额度内照常查");
+    client
+        .pickup_message(region, "R101", &part)
+        .await
+        .expect("额度内照常查");
 
     let started = std::time::Instant::now();
     match client.pickup_message(region, "R102", &part).await {
         Err(ApiError::RateLimited(detail)) => assert!(detail.contains("跳过"), "{detail}"),
         other => panic!("额度要等 10 秒、上限 1 秒，应当直接报限流，实际是 {other:?}"),
     }
-    assert!(started.elapsed() < Duration::from_millis(500), "不该排队等额度");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "不该排队等额度"
+    );
     assert_eq!(apple.requests(PICKUP_PATH).len(), 1, "跳过的查询不该发出去");
 }
 
@@ -1066,17 +1108,29 @@ async fn sim_shift_wave() {
         urls.push(p.url());
         keep.push(p);
     }
-    let wait_cap = std::env::var("SIM_CAP").ok().map(|v| scale(v.parse().unwrap()));
-    let client = Arc::new(AppleClient::new(ClientConfig {
-        min_interval: scale(0.15),
-        max_retries: 0,
-        direct_route: false,
-        proxies: urls,
-        budget: apw_core::apple::Budget { capacity: 5, refill_every: scale(60.0) },
-        rest: Some(apw_core::apple::RestPolicy { max_requests: 25, rest: scale(2100.0), jitter: 0.2 }),
-        max_route_wait: wait_cap,
-        ..ClientConfig::default()
-    }).expect("client"));
+    let wait_cap = std::env::var("SIM_CAP")
+        .ok()
+        .map(|v| scale(v.parse().unwrap()));
+    let client = Arc::new(
+        AppleClient::new(ClientConfig {
+            min_interval: scale(0.15),
+            max_retries: 0,
+            direct_route: false,
+            proxies: urls,
+            budget: apw_core::apple::Budget {
+                capacity: 5,
+                refill_every: scale(60.0),
+            },
+            rest: Some(apw_core::apple::RestPolicy {
+                max_requests: 25,
+                rest: scale(2100.0),
+                jitter: 0.2,
+            }),
+            max_route_wait: wait_cap,
+            ..ClientConfig::default()
+        })
+        .expect("client"),
+    );
     let sem = Arc::new(tokio::sync::Semaphore::new(8));
     let stats = Arc::new(Mutex::new(Vec::<(f64, f64, bool)>::new()));
     let t0 = std::time::Instant::now();
@@ -1089,12 +1143,17 @@ async fn sim_shift_wave() {
         next += period / 38;
         tokio::time::sleep_until(next).await;
         seed += 1;
-        let Ok(permit) = sem.clone().try_acquire_owned() else { continue };
+        let Ok(permit) = sem.clone().try_acquire_owned() else {
+            continue;
+        };
         let (client, stats) = (Arc::clone(&client), Arc::clone(&stats));
         let store = format!("R{}", 100 + seed % 38);
         tokio::spawn(async move {
             let s = t0.elapsed().as_secs_f64() * 100.0;
-            let ok = client.pickup_message(region, &store, &["MG724CH/A".to_string()]).await.is_ok();
+            let ok = client
+                .pickup_message(region, &store, &["MG724CH/A".to_string()])
+                .await
+                .is_ok();
             let e = t0.elapsed().as_secs_f64() * 100.0;
             stats.lock().unwrap().push((s, e - s, ok));
             drop(permit);
