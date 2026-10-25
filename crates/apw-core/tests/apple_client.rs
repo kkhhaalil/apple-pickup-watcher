@@ -977,3 +977,139 @@ async fn 换代理立即生效并按线路各自记预算() {
         started.elapsed()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn 并发查询分散到各条线路而不是挤在最快的那条上排队() {
+    let apple = FakeApple::start(healthy).await;
+    let proxy = FakeProxy::start("proxy1").await;
+    let region = apple.region();
+    let client = Arc::new(fast(ClientConfig {
+        warm_page: WarmPage::None,
+        max_retries: 0,
+        budget: apw_core::apple::Budget {
+            capacity: 1,
+            refill_every: Duration::from_millis(400),
+        },
+        ..ClientConfig::default()
+    }));
+    client.set_proxies(&[proxy.url()]).await.expect("加代理");
+    let part = ["MG724CH/A".to_string()];
+    // 两条线路的额度各用掉一次，之后谁都得等，其中一条会早几毫秒恢复。
+    for store in ["R101", "R102"] {
+        client.pickup_message(region, store, &part).await.expect("先用掉额度");
+    }
+
+    let started = std::time::Instant::now();
+    let tasks: Vec<_> = ["R103", "R104", "R105", "R106"]
+        .into_iter()
+        .map(|store| {
+            let client = Arc::clone(&client);
+            let part = part.clone();
+            tokio::spawn(async move { client.pickup_message(region, store, &part).await })
+        })
+        .collect();
+    for task in tasks {
+        task.await.expect("任务").expect("查询");
+    }
+    // 挤在一条线路上要等 4 个恢复周期（约 1.6 秒），两条分摊只要 2 个。
+    assert!(
+        started.elapsed() < Duration::from_millis(1200),
+        "并发查询应当分摊到两条线路：用了 {:?}",
+        started.elapsed()
+    );
+    let routes = pickup_routes(&client.recent_requests().await);
+    let direct = routes.iter().filter(|(r, _)| r == "direct").count();
+    assert_eq!(direct, 3, "六次查询应当两条线路各三次：{routes:?}");
+}
+
+#[tokio::test]
+async fn 所有线路都要等太久时直接报限流而不去排队() {
+    let apple = FakeApple::start(healthy).await;
+    let region = apple.region();
+    let client = fast(ClientConfig {
+        warm_page: WarmPage::None,
+        max_retries: 0,
+        budget: apw_core::apple::Budget {
+            capacity: 1,
+            refill_every: Duration::from_secs(10),
+        },
+        max_route_wait: Some(Duration::from_secs(1)),
+        ..ClientConfig::default()
+    });
+    let part = ["MG724CH/A".to_string()];
+    client.pickup_message(region, "R101", &part).await.expect("额度内照常查");
+
+    let started = std::time::Instant::now();
+    match client.pickup_message(region, "R102", &part).await {
+        Err(ApiError::RateLimited(detail)) => assert!(detail.contains("跳过"), "{detail}"),
+        other => panic!("额度要等 10 秒、上限 1 秒，应当直接报限流，实际是 {other:?}"),
+    }
+    assert!(started.elapsed() < Duration::from_millis(500), "不该排队等额度");
+    assert_eq!(apple.requests(PICKUP_PATH).len(), 1, "跳过的查询不该发出去");
+}
+
+/// 把服务端扫描（250 条线路、30 秒一轮、轮班、8 个并发）按 1/100 的时间缩放跑
+/// 相当于 2.5 小时的量，打印每 5 分钟的完成数和慢查询。手动跑：
+/// `cargo test -p apw-core --test apple_client sim_shift_wave -- --ignored --nocapture`；
+/// `SIM_CAP=20` 模拟 `max_route_wait` 为 20 秒。
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn sim_shift_wave() {
+    let scale = |d: f64| Duration::from_secs_f64(d / 100.0);
+    let apple = FakeApple::start(healthy).await;
+    let region = apple.region();
+    let mut urls = Vec::new();
+    let mut keep = Vec::new();
+    for i in 0..250 {
+        let name: &'static str = Box::leak(format!("p{i}").into_boxed_str());
+        let p = FakeProxy::start(name).await;
+        urls.push(p.url());
+        keep.push(p);
+    }
+    let wait_cap = std::env::var("SIM_CAP").ok().map(|v| scale(v.parse().unwrap()));
+    let client = Arc::new(AppleClient::new(ClientConfig {
+        min_interval: scale(0.15),
+        max_retries: 0,
+        direct_route: false,
+        proxies: urls,
+        budget: apw_core::apple::Budget { capacity: 5, refill_every: scale(60.0) },
+        rest: Some(apw_core::apple::RestPolicy { max_requests: 25, rest: scale(2100.0), jitter: 0.2 }),
+        max_route_wait: wait_cap,
+        ..ClientConfig::default()
+    }).expect("client"));
+    let sem = Arc::new(tokio::sync::Semaphore::new(8));
+    let stats = Arc::new(Mutex::new(Vec::<(f64, f64, bool)>::new()));
+    let t0 = std::time::Instant::now();
+    let total = scale(9000.0);
+    let period = scale(30.0);
+    let mut seed = 0usize;
+    let mut next = tokio::time::Instant::now();
+    while t0.elapsed() < total {
+        // 38 个种子均匀撒在一个周期里；种子还在飞就跳过（和 worker 一样）。
+        next += period / 38;
+        tokio::time::sleep_until(next).await;
+        seed += 1;
+        let Ok(permit) = sem.clone().try_acquire_owned() else { continue };
+        let (client, stats) = (Arc::clone(&client), Arc::clone(&stats));
+        let store = format!("R{}", 100 + seed % 38);
+        tokio::spawn(async move {
+            let s = t0.elapsed().as_secs_f64() * 100.0;
+            let ok = client.pickup_message(region, &store, &["MG724CH/A".to_string()]).await.is_ok();
+            let e = t0.elapsed().as_secs_f64() * 100.0;
+            stats.lock().unwrap().push((s, e - s, ok));
+            drop(permit);
+        });
+    }
+    let st = stats.lock().unwrap().clone();
+    let mut line = String::new();
+    for w in 0..30 {
+        let (a, b) = (w as f64 * 300.0, (w + 1) as f64 * 300.0);
+        let n = st.iter().filter(|x| x.0 >= a && x.0 < b && x.2).count();
+        let f = st.iter().filter(|x| x.0 >= a && x.0 < b && !x.2).count();
+        line += &format!("{}m:{n}/{f} ", w * 5);
+    }
+    let slow = st.iter().filter(|x| x.1 > 30.0).count();
+    let max = st.iter().map(|x| x.1).fold(0.0, f64::max);
+    println!("SIM ok/failed per 5min: {line}");
+    println!("SIM queries {} slow>30s {slow} max {max:.0}s", st.len());
+}

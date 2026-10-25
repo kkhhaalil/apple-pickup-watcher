@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -567,6 +567,26 @@ struct Route {
     warm: Mutex<HashMap<String, WarmState>>,
     blocks: Mutex<BlockTracker>,
     budget: Mutex<BudgetState>,
+    /// 已经选中这条线路、还没结束的查询数。它们的额度要到 [`AppleClient::throttle`]
+    /// 才真正预约，挑线路时得先算上，否则同时进来的几个查询看到的是同一份令牌桶，
+    /// 会一起挤到「看上去最快」的那条线路上排队。
+    pending: AtomicU32,
+}
+
+/// 一次查询占着某条线路的凭据，查询在这条线路上结束（成功、失败或被取消）时归还。
+struct PendingHold(Arc<Route>);
+
+impl PendingHold {
+    fn take(route: &Arc<Route>) -> Self {
+        route.pending.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(route))
+    }
+}
+
+impl Drop for PendingHold {
+    fn drop(&mut self) {
+        self.0.pending.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Route {
@@ -585,6 +605,7 @@ impl Route {
             warm: Mutex::new(HashMap::new()),
             blocks: Mutex::new(BlockTracker::default()),
             budget: Mutex::new(BudgetState::new(&config.budget, Instant::now())),
+            pending: AtomicU32::new(0),
         })
     }
 
@@ -882,6 +903,13 @@ pub struct ClientConfig {
     pub reset_session_on_block: bool,
     /// 线路轮班策略，见 [`RestPolicy`]。`None`（默认）表示不轮班。
     pub rest: Option<RestPolicy>,
+    /// 挑线路时最多肯为预算等多久。`None`（默认）表示一直等。
+    ///
+    /// 设了之后，所有可用线路都要等超过这么久时，查询直接报
+    /// [`ApiError::RateLimited`]，不去排队。服务端扫描要设：2026-10-25 那次 250 条
+    /// 线路的运行里，大批线路同时下班的那几分钟，8 个并发查询各自预约到十几分钟后
+    /// 的额度，把并发名额全占住，调度整整停了 15 分钟。跳过一批比全体干等强。
+    pub max_route_wait: Option<Duration>,
 }
 
 impl Default for ClientConfig {
@@ -899,6 +927,7 @@ impl Default for ClientConfig {
             session: None,
             reset_session_on_block: true,
             rest: None,
+            max_route_wait: None,
         }
     }
 }
@@ -978,6 +1007,8 @@ pub struct AppleClient {
     last_sent: Arc<Mutex<Option<Instant>>>,
     /// 最近的出站请求记录。
     recent: Arc<Mutex<VecDeque<RequestRecord>>>,
+    /// 挑线路一次只挑一个：排名、占位要连成一步，并发查询才看得到彼此占了哪条。
+    picking: Arc<Mutex<()>>,
 }
 
 impl AppleClient {
@@ -989,6 +1020,7 @@ impl AppleClient {
             config,
             last_sent: Arc::new(Mutex::new(None)),
             recent: Arc::new(Mutex::new(VecDeque::with_capacity(RECENT_RECORDS))),
+            picking: Arc::new(Mutex::new(())),
         })
     }
 
@@ -1232,7 +1264,8 @@ impl AppleClient {
         &self,
         region: &Region,
         tried: &[String],
-    ) -> Result<(Arc<Route>, bool), ApiError> {
+    ) -> Result<(Arc<Route>, bool, PendingHold), ApiError> {
+        let _picking = self.picking.lock().await;
         let routes = self.routes.read().await.clone();
         let n = routes.len().max(1);
         let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
@@ -1252,11 +1285,13 @@ impl AppleClient {
             };
             match availability {
                 RouteAvailability::Free => {
+                    // 已经选了这条线路、还没预约额度的查询排在前面，算上它们。
+                    let ahead = route.pending.load(Ordering::Relaxed) as usize;
                     let wait = route
                         .budget
                         .lock()
                         .await
-                        .wait_for(&self.config.budget, now, 1);
+                        .wait_for(&self.config.budget, now, 1 + ahead);
                     ranked.push((i, wait));
                 }
                 other => unavailable.push((route.label.clone(), other)),
@@ -1264,6 +1299,16 @@ impl AppleClient {
         }
         // 稳定排序：等待时间相同的保持轮转顺序。
         ranked.sort_by_key(|(_, wait)| *wait);
+        // 等得太久的线路不选，见 [`ClientConfig::max_route_wait`]。
+        let mut too_long: Option<Duration> = None;
+        if let Some(cap) = self.config.max_route_wait {
+            if let Some(&(_, best)) = ranked.first()
+                && best > cap
+            {
+                too_long = Some(best);
+            }
+            ranked.retain(|(_, wait)| *wait <= cap);
+        }
         for (i, _) in ranked {
             let route = &routes[i];
             if let Ok(probing) = route
@@ -1272,8 +1317,14 @@ impl AppleClient {
                 .await
                 .admit(region.locale, Instant::now())
             {
-                return Ok((Arc::clone(route), probing));
+                return Ok((Arc::clone(route), probing, PendingHold::take(route)));
             }
+        }
+        if let Some(wait) = too_long {
+            return Err(ApiError::RateLimited(format!(
+                "各线路的请求额度都在恢复，最快也要{}后，这一轮跳过",
+                human_duration(wait)
+            )));
         }
 
         // 只有直连一条：沿用原来的提示，桌面端和测试都认这两句话。
@@ -1291,7 +1342,7 @@ impl AppleClient {
                 .await
                 .admit(region.locale, Instant::now())
             {
-                Ok(probing) => Ok((Arc::clone(route), probing)),
+                Ok(probing) => Ok((Arc::clone(route), probing, PendingHold::take(route))),
                 Err(err) => Err(err),
             };
         }
@@ -1451,7 +1502,7 @@ impl AppleClient {
         // 每条线路本次最多试一次：被拦或代理不通就换下一条，全试完才把最后的错误
         // 交出去。只有直连时和以前完全一样：一次请求，被拦就冷却。
         for _ in 0..attempts {
-            let (route, probing) = match self.pick_route(region, &tried).await {
+            let (route, probing, _hold) = match self.pick_route(region, &tried).await {
                 Ok(picked) => picked,
                 Err(err) => return Err(summarize_round(last_err.unwrap_or(err), &outcomes)),
             };
